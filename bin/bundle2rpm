@@ -1,0 +1,375 @@
+#!/bin/env ruby
+
+# bundle2rpm
+# Matt Savona - 2011
+# 
+# Leverage the lovely Gem Bundler tool to produce nicely packaged RPMs.
+
+require "fileutils"
+require "optparse"
+require "time"
+require "pp"
+
+TMP_DIR = "/tmp"
+
+@variable_map = {
+  :package_name    => { :default => "rubygem-custom_bundle", :comment => "Name of your package (mybundle)." },
+  :package_version => { :default => "1.0.0", :comment => "Version number of your package (ex. 1.0.0)." },
+  :package_release => { :default => "1", :comment => "Release number of your package (ex. 1)." },
+  :author          => { :default => "bundle2rpm", :comment => "Your name (ex. John Smith)." },
+  :email           => { :default => "bundle2rpm@localhost", :comment => "Your email (ex. john@example.com)." },
+  :url             => { :default => "http://localhost/", :comment => "Your URL (ex. http://loopforever.com)." },
+  :license         => { :default => "GPL", :comment => "License for your package (ex. GPL)." },
+  :user            => { :default => "root", :comment => "Username that owns the files in this RPM (ex. jsmith)." },
+  :group           => { :default => "root", :comment => "Groupname that owns the files in this RPM (ex. developers)." },
+  :changelog       => { :immutable => true, :deferred_default => { :stage => 0, :invoke => :changelog } }
+}
+
+@options = {}
+
+@gemfile, @prefix, @verbose, @no_cleanup, @package_full_name = nil
+@tmp_dir, @working_dir, @save_rpm_to, @rpm_spec_file = nil
+
+module Exceptions
+  class ArgumentError < StandardError; end
+  class BuildError < StandardError; end
+  class CommandError < StandardError; end
+end
+
+def main
+  deferred_variables = [ [],[],[] ]
+
+  OptionParser.new do |o|
+    o.banner = "Usage: #{$0} [options] /path/to/Gemfile /path/to/install/into"
+
+    o.separator ""
+    o.separator "RPM spec file options:"
+
+    @variable_map.each do |k,v|
+      next if v[:immutable]
+
+      o.on("--#{k.to_s.gsub(/_/, "-")} VALUE", v[:comment]) do |ov|
+        @options[k] = ov
+      end
+    end
+
+    o.separator ""
+    o.separator "General options:"
+    o.on("--bundler VERSION", "Pull in and package this version of bundler (from Rubyforge/Gemcutter only). Defaults to the same version of bundler that is used to construct your RPM (first in your PATH).") do |ov|
+      @options[:bundler_version] = ov
+    end
+    o.on("--save-rpm-to DIR", "If specified, the RPM built for you will be written to this directory. Defaults to your working directory.") do |ov|
+      @options[:save_rpm_to] = ov
+    end
+    o.on("--no-cleanup", "Do not cleanup working directory. Useful only for debugging purposes, normally you want your transient build files cleaned up.") do |ov|
+      @no_cleanup = true
+    end
+    o.on("--tmp-dir DIR", "Temporary directory to use for transient `bundle install` and RPM build files.") do |ov|
+      @options[:tmp_dir] = ov
+    end
+    o.on("-v", "--verbose", "Print additional output.") do |ov|
+      @verbose = true
+    end
+    o.on_tail("-h", "--help", "Show this message.") do
+      puts o
+      exit
+    end
+  end.parse!
+
+  @gemfile = normalize_path(ARGV[0])
+  @prefix  = normalize_path(ARGV[1])
+  @tmp_dir = normalize_path(@options[:tmp_dir] || TMP_DIR)
+  @save_rpm_to = normalize_path(@options[:save_rpm_to] || FileUtils.pwd)
+
+  raise Exceptions::ArgumentError, "You must specify the path to an existing Gemfile." if !@gemfile || !File.exists?(@gemfile)
+  raise Exceptions::ArgumentError, "You must specify the path where you want your RPM to install into." if !@prefix
+
+  puts "---"
+  puts "Gemfile:        #{@gemfile}"
+  puts "Install Prefix: #{@prefix}"
+  puts "---"
+
+  # Define a value for all entries in the @variable_map, either user supplied or default:
+  @variable_map.each do |k,v|
+    if v[:deferred_default]
+      deferred_variables[v[:deferred_default][:stage]] << { :key => k, :invoke => v[:deferred_default][:invoke] }
+    end
+      
+    @variable_map[k][:value] = @options[k] || v[:default]
+  end
+
+  # Some variables are deferred, meaning their value cannot be known until other variable's have values assigned
+  # to them. These can be deferred into (upto) three stages:
+  deferred_variables.each do |stage|
+    stage.each do |deferred_variable|
+      @variable_map[deferred_variable[:key]][:value] = self.send(deferred_variable[:invoke])
+    end
+  end
+
+  @package_full_name = []
+  @package_full_name << @variable_map[:package_name][:value]
+  @package_full_name << @variable_map[:package_version][:value]
+  @package_full_name << @variable_map[:package_release][:value]
+  @package_full_name = @package_full_name.join("-")
+  @working_dir = setup_working_dir
+  @rpm_spec_file = write_rpm_spec("#{@working_dir}/rpmbuild/SPECS/#{@package_full_name}.spec")
+  prepare_bundle
+  build_rpm
+end
+
+def write_rpm_spec(to_file)
+  puts "Generating RPM spec file."
+  
+  spec_file = DATA.read
+
+  # Replace all |xxx| variables in our template with the mapped
+  # values via @variable_map:
+  @variable_map.each do |k,v|
+    spec_file.gsub!(/\|#{k.to_s}\|/, v[:value])
+  end
+
+  File.open(to_file, "w") do |f|
+    f.puts spec_file
+  end
+
+  return to_file
+end
+
+def prepare_bundle
+  puts "Bundling your gems."
+
+  # Don't let people's custom gem environments get in the way:
+  ENV["GEM_HOME"] = ENV["GEM_PATH"] = nil
+
+  bundler_version = @options[:bundler_version] || get_bundler_version
+  bundle_into = "#{@working_dir}/rpmbuild/SOURCES/#{@package_full_name}"
+  bundle_config_file = "#{bundle_into}/.bundle/config"
+
+  # Make ourselves a /bin directory to store our artificial ruby binaries:
+  FileUtils.mkdir("#{bundle_into}/bin")
+
+  # Copy over Gemfile and Gemfile.lock into our source directory:
+  [@gemfile, "#{@gemfile}.lock"].each do |gf|
+    FileUtils.cp(gf, bundle_into) if File.exists?(gf)
+  end
+
+  # No .lock file exists yet, so we need to bundle install first:
+  if !File.exists?("#{bundle_into}/Gemfile.lock")
+    exec_command("bundle install --gemfile #{bundle_into}/Gemfile --path #{bundle_into} --binstubs #{bundle_into}/bundle_bin")
+  end
+
+  # Install in "deployment" mode:
+  exec_command("bundle install --deployment --gemfile #{bundle_into}/Gemfile --path #{bundle_into} --binstubs #{bundle_into}/bundle_bin")
+
+  # We don't make any assumptions about the ruby version, so glob in order
+  # to find the paths we're looking for:
+  source_gem_path = source_bin_path = nil
+  Dir["#{bundle_into}/ruby/*/*"].each do |d|
+    case File.basename(d)
+      when "gems"
+        source_gem_path = d.gsub(/\/gems$/, "")
+    end
+  end 
+
+  # It is permissible for a bundle to not include a bin_path, but it must contain a gem path:
+  raise Exceptions::BuildError, "Unable to determine appropriate Gem path value for your bundle. Unable to proceed." unless source_gem_path
+
+  source_bin_path = "#{source_gem_path}/bin"
+
+  # At this point we want all Rubygem interaction within our source directory:
+  ENV["GEM_HOME"] = ENV["GEM_PATH"] = source_gem_path
+
+  # Pull in bundler for packaging inside the RPM itself:
+  exec_command("gem install bundler -v #{bundler_version} --no-rdoc --no-ri")
+
+  # Move our Bundler binstubs to a more sensible location (adjacent to the bin directory Rubygems would create):
+  source_bundle_bin_path = File.expand_path("#{source_bin_path}/../bundle_bin")
+  FileUtils.mv("#{bundle_into}/bundle_bin", source_bundle_bin_path)
+
+  # Chop off our build prefix, so we can insert some magic (REPLACE_WITH_BUNDLE_DIR)
+  # that will be interpolated at RPM post-install time:
+  built_gem_path = source_gem_path.gsub(/^#{bundle_into}\//, "")
+  built_bin_path = source_bin_path.gsub(/^#{bundle_into}\//, "")
+  built_bundle_bin_path = source_bundle_bin_path.gsub(/^#{bundle_into}\//, "")
+
+  # Rewrite the bundler config file to normalize paths:
+  bundle_config = File.read(bundle_config_file)
+  bundle_config = bundle_config.gsub(/#{bundle_into}/, "REPLACE_WITH_BUNDLE_DIR")
+  bundle_config = bundle_config.gsub(/\/bundle_bin/, "/#{built_bundle_bin_path}")
+  File.open(bundle_config_file, "w") { |f| f.puts bundle_config }
+
+  # REPLACE_WITH_BUNDLE_DIR is interpolated at post-install time, as that is
+  # the only time when the value is known since this is built as a relocatable
+  # RPM:
+  File.open("#{bundle_into}/bin/env.bash", "w") do |f|
+    f.puts <<-EOS
+#!/bin/bash
+export B2R_BUNDLE_DIR="REPLACE_WITH_BUNDLE_DIR"
+export GEM_HOME="${B2R_BUNDLE_DIR}/#{built_gem_path}"
+export GEM_PATH="${B2R_BUNDLE_DIR}/#{built_gem_path}"
+export BUNDLE_GEMFILE="${B2R_BUNDLE_DIR}/Gemfile"
+export PATH="${B2R_BUNDLE_DIR}/#{built_bundle_bin_path}:${B2R_BUNDLE_DIR}/#{built_bin_path}:$PATH"
+    EOS
+  end
+
+  ["ruby", "irb"].each do |bin|
+    File.open("#{bundle_into}/bin/#{bin}", "w") do |f|
+      f.puts <<-EOS
+#!/bin/bash
+. "REPLACE_WITH_BUNDLE_DIR/bin/env.bash"
+
+/bin/env #{bin} $@
+      EOS
+    end
+
+    File.chmod(0755, "#{bundle_into}/bin/#{bin}")
+  end
+end
+
+def get_bundler_version
+  bundler_version = `bundle -v 2>&1`
+
+  if $? == 0
+    # Bundler version 1.0.15
+    if bundler_version =~ /^Bundler version (.*)$/
+      return $1.strip
+    end
+  end
+
+  raise Exceptions::BuildError, "Unable to determine existing bundler version. You can explicitly set this with the --bundler option or try running `bundle -v` yourself and confirming a version number is returned."
+end
+
+def build_rpm
+  puts "Building RPM."
+
+  exec_command("rpmbuild --define '_topdir #{@working_dir}/rpmbuild' --define '_prefix #{@prefix}' -ba #{@rpm_spec_file}")
+
+  # Move any RPMs we built into @save_rpm_to:
+  Dir["#{@working_dir}/rpmbuild/RPMS/*/*.rpm"].each do |src_path|
+    filename = File.basename(src_path)
+    dest_path = "#{@save_rpm_to}/#{filename}"
+    FileUtils.mv(src_path, dest_path, :force => true)
+
+    puts "Wrote RPM: #{dest_path}"
+  end
+end
+
+def changelog(comment = "bundle2rpm managed build")
+  date = Time.now.strftime("%a %b %e %Y")
+
+  entries = [] 
+  entries << "* #{date} #{@variable_map[:author][:value]} <#{@variable_map[:email][:value]}> #{@variable_map[:package_version][:value]}-#{@variable_map[:package_release][:value]}"
+  entries << "- #{comment[0..79]}\n"
+
+  return entries.join("\n")
+end
+
+def normalize_path(path)
+  return nil if path.nil? || path.empty?
+  return File.expand_path(path).gsub(/\/$/, "")
+end
+
+def exec_command(command, fatal = true)
+  output_buffer = []
+  puts "+ #{command}" if @verbose
+
+  IO.popen("#{command} 2>&1") do |output|
+    while line = output.gets do
+      if @verbose
+        puts "> #{line}"
+      else
+        output_buffer << "> #{line}"
+      end
+    end
+  end
+
+  if $? != 0
+    puts "+ #{command}" if !@verbose
+    puts output_buffer
+    raise Exceptions::CommandError, "Failure of previous command was fatal, stopping." if fatal
+  end
+end
+
+def setup_working_dir
+  working_dir = "#{@tmp_dir}/bundle2rpm-#{@variable_map[:package_name][:value]}-#{Time.now.to_i.to_s}"
+
+  # This is the root working directory:
+  FileUtils.mkdir(working_dir)
+
+  # This is the rpmbuild directory structure:
+  %w{ BUILD RPMS SOURCES SPECS SRPMS }.each do |d|
+    FileUtils.mkdir_p("#{working_dir}/rpmbuild/#{d}")
+  end
+
+  # This is where we'll deploy via `bundle install`:
+  FileUtils.mkdir("#{working_dir}/rpmbuild/SOURCES/#{@package_full_name}")  
+
+  # This is our transient GEM_HOME:
+  FileUtils.mkdir("#{working_dir}/.gems")
+
+  return working_dir
+end
+
+def cleanup_working_dir
+  return if !@working_dir || !File.exists?(@working_dir)
+  FileUtils.rm_rf(@working_dir)
+end
+
+begin
+  main
+rescue SystemExit, Interrupt
+  puts "Cancelling bundle2rpm operations at your request."
+rescue Exceptions::ArgumentError => e
+  puts "#{e.class}: #{e.message}"
+rescue Exceptions::BuildError => e
+  puts "#{e.class}: #{e.message}"
+rescue Exceptions::CommandError => e
+  puts "#{e.class}: #{e.message}"
+ensure
+  cleanup_working_dir unless @no_cleanup
+end
+
+__END__
+Summary: bundle2rpm Package
+Name: |package_name|
+Version: |package_version|
+Release: |package_release|
+License: |license|
+Group: Applications/RubyGems
+URL: |url|
+BuildRoot: %{_tmppath}/%{name}-root
+Prefix: %(echo %{_prefix})
+AutoProv: no
+
+%description
+This package was generated by bundle2rpm. It contains a deployed Gem bundle which
+may contain one or more individual Ruby Gems.
+
+%install
+[ -d ${RPM_BUILD_ROOT} ] && rm -rf ${RPM_BUILD_ROOT}
+install -d ${RPM_BUILD_ROOT}%{_prefix}
+cp -R ${RPM_SOURCE_DIR}/* ${RPM_BUILD_ROOT}%{_prefix}
+
+find ${RPM_BUILD_ROOT}%{_prefix} \( \( -type f -o -type l \) -printf '"%%p"\n' \) \
+        -o \( -type d -a -printf '%%%%dir "%%p"\n' \) \
+        | sed "s@${RPM_BUILD_ROOT}@@g" \
+        > bundle.lst
+
+# Remove the first line, it's the prefix-dir which we do not
+# want under rpm control:
+sed -i 1d bundle.lst
+
+%post
+#!/bin/bash
+bundle_dir="%{_prefix}/%{name}-%{version}-%{release}"
+sed -i "s@REPLACE_WITH_BUNDLE_DIR@${bundle_dir}@g" ${bundle_dir}/.bundle/*
+sed -i "s@REPLACE_WITH_BUNDLE_DIR@${bundle_dir}@g" ${bundle_dir}/bin/*
+
+%clean
+[ -d ${RPM_BUILD_ROOT} ] && rm -rf ${RPM_BUILD_ROOT}
+
+%files -f bundle.lst
+%defattr(-,|user|,|group|,-)
+
+%changelog
+|changelog|
