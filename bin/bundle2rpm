@@ -58,6 +58,9 @@ def main
     o.on("--bundler VERSION", "Pull in and package this version of bundler (from Rubyforge/Gemcutter only). Defaults to the same version of bundler that is used to construct your RPM (first in your PATH).") do |ov|
       @options[:bundler_version] = ov
     end
+    o.on("--custom-rpm-spec SPECFILE", "If specified, use this RPM spec file to construct the RPM.") do |ov|
+      @rpm_spec_file = ov
+    end
     o.on("--save-rpm-to DIR", "If specified, the RPM built for you will be written to this directory. Defaults to your working directory.") do |ov|
       @options[:save_rpm_to] = ov
     end
@@ -112,7 +115,7 @@ def main
   @package_full_name << @variable_map[:package_release][:value]
   @package_full_name = @package_full_name.join("-")
   @working_dir = setup_working_dir
-  @rpm_spec_file = write_rpm_spec("#{@working_dir}/rpmbuild/SPECS/#{@package_full_name}.spec")
+  @rpm_spec_file ||= write_rpm_spec("#{@working_dir}/rpmbuild/SPECS/#{@package_full_name}.spec")
   prepare_bundle
   build_rpm
 end
