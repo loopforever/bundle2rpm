@@ -59,7 +59,7 @@ def main
       @options[:bundler_version] = ov
     end
     o.on("--custom-rpm-spec SPECFILE", "If specified, use this RPM spec file to construct the RPM.") do |ov|
-      @rpm_spec_file = ov
+      @rpm_spec_file = normalize_path(ov)
     end
     o.on("--save-rpm-to DIR", "If specified, the RPM built for you will be written to this directory. Defaults to your working directory.") do |ov|
       @options[:save_rpm_to] = ov
