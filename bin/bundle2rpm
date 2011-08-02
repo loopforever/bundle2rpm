@@ -59,7 +59,7 @@ def main
       @options[:bundler_version] = ov
     end
     o.on("--custom-rpm-spec SPECFILE", "If specified, use this RPM spec file to construct the RPM.") do |ov|
-      @rpm_spec_file = normalize_path(ov)
+      @options[:custom_rpm_spec] = normalize_path(ov)
     end
     o.on("--save-rpm-to DIR", "If specified, the RPM built for you will be written to this directory. Defaults to your working directory.") do |ov|
       @options[:save_rpm_to] = ov
@@ -115,7 +115,7 @@ def main
   @package_full_name << @variable_map[:package_release][:value]
   @package_full_name = @package_full_name.join("-")
   @working_dir = setup_working_dir
-  @rpm_spec_file ||= write_rpm_spec("#{@working_dir}/rpmbuild/SPECS/#{@package_full_name}.spec")
+  @rpm_spec_file = write_rpm_spec("#{@working_dir}/rpmbuild/SPECS/#{@package_full_name}.spec")
   prepare_bundle
   build_rpm
 end
@@ -123,7 +123,7 @@ end
 def write_rpm_spec(to_file)
   puts "Generating RPM spec file."
   
-  template_path = File.expand_path(File.dirname(__FILE__) + "/../etc/template.spec") 
+  template_path = @options[:custom_rpm_spec] || File.expand_path(File.dirname(__FILE__) + "/../etc/template.spec") 
   spec_file = File.read(template_path)
 
   # Replace all |xxx| variables in our template with the mapped
