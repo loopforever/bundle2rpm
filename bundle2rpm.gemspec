@@ -1,6 +1,6 @@
 spec = Gem::Specification.new do |s|
   s.name = "bundle2rpm"
-  s.version = "1.0.3"
+  s.version = "1.0.4"
   s.platform = Gem::Platform::RUBY
   s.date = "2011-07-12"
   s.rubyforge_project = "bundle2rpm"
